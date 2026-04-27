@@ -127,6 +127,12 @@ class EphemerisEngineSkyfield:
             Dictionary mapping planet names to position data
         """
         # Convert IST to UTC (subtract 5 hours 30 minutes)
+        if dt.tzinfo is not None:
+            raise ValueError(
+                "datetime must be a naive IST datetime (no tzinfo). "
+                "Do NOT pass UTC or any timezone-aware datetime. "
+                "Pass the local IST birth time directly."
+            )
         utc_dt = dt - timedelta(hours=5, minutes=30)
         
         # Create Skyfield time object
@@ -142,10 +148,11 @@ class EphemerisEngineSkyfield:
         ayanamsa = self._calculate_ayanamsa(decimal_year)
         
         results = {}
-        
-        # Observer location
-        observer = self.earth + wgs84.latlon(lat, lon)
-        
+
+        # Use geocentric positions (from Earth's centre) — standard in astrology.
+        # Topocentric positions introduce a significant parallax error for the Moon
+        # (up to ~57' = 0.95°) and are NOT used by any Vedic astrology software.
+
         # Calculate each planet
         planets = {
             "Sun": self.sun,
@@ -156,22 +163,22 @@ class EphemerisEngineSkyfield:
             "Jupiter": self.jupiter,
             "Saturn": self.saturn
         }
-        
+
         for planet_name, planet_obj in planets.items():
-            # Get apparent position from observer
-            astrometric = observer.at(t).observe(planet_obj)
+            # Geocentric apparent position
+            astrometric = self.earth.at(t).observe(planet_obj)
             apparent = astrometric.apparent()
-            
+
             # Get tropical longitude
             tropical_lon = self._ecliptic_longitude(apparent)
-            
+
             # Convert to sidereal
             sidereal_lon = (tropical_lon - ayanamsa) % 360
-            
+
             # Calculate speed (approximate - 1 day difference)
             t_next = self.ts.utc(utc_dt.year, utc_dt.month, utc_dt.day + 1,
                                 utc_dt.hour, utc_dt.minute, utc_dt.second)
-            astrometric_next = observer.at(t_next).observe(planet_obj)
+            astrometric_next = self.earth.at(t_next).observe(planet_obj)
             apparent_next = astrometric_next.apparent()
             tropical_lon_next = self._ecliptic_longitude(apparent_next)
             
@@ -191,10 +198,10 @@ class EphemerisEngineSkyfield:
             }
         
         # Calculate Rahu (Mean North Node)
-        # Approximate Rahu position (mean node)
-        # Using astronomical calculation for Moon's node
-        # This is a simplified calculation
-        mean_node_lon = (125.044522 - 0.0529539 * (decimal_year - 2000)) % 360
+        # Standard IAU formula: Ω = 125.04452 − 0.0529539°/day × d
+        # where d = Julian days from J2000.0  (NOT years — 0.0529539 is deg/day)
+        d_j2000 = t.tt - 2451545.0
+        mean_node_lon = (125.044522 - 0.0529539 * d_j2000) % 360
         rahu_sidereal = (mean_node_lon - ayanamsa) % 360
         
         results["Rahu"] = {
@@ -328,6 +335,77 @@ class EphemerisEngineSkyfield:
             "d9_sign": d9_sign,
             "element": element_map[d1_sign],
             "vargottama": vargottama
+        }
+
+    def calculate_ascendant(self, dt: datetime, lat: float, lon: float) -> dict:
+        """
+        Calculate the Ascendant (Lagna) — sidereal longitude, Lahiri ayanamsa.
+
+        The Ascendant is the ecliptic degree rising on the eastern horizon at
+        the moment of birth.  Formula: standard oblique-angle ascendant from
+        the Right Ascension of the MC (= Local Mean Sidereal Time).
+
+        Args:
+            dt:  Birth datetime (naive IST — no tzinfo)
+            lat: Geographic latitude  (degrees, +N)
+            lon: Geographic longitude (degrees, +E)
+
+        Returns:
+            Dict with keys: longitude, sign, degree, nakshatra, retrograde, speed
+        """
+        import math
+
+        if dt.tzinfo is not None:
+            raise ValueError(
+                "datetime must be a naive IST datetime (no tzinfo). "
+                "Pass the local IST birth time directly."
+            )
+
+        utc_dt = dt - timedelta(hours=5, minutes=30)
+        t = self.ts.utc(
+            utc_dt.year, utc_dt.month, utc_dt.day,
+            utc_dt.hour, utc_dt.minute, utc_dt.second
+        )
+
+        # GMST (hours) → RAMC / Local Sidereal Time (degrees)
+        ramc_deg = (t.gmst * 15.0 + lon) % 360
+
+        # Obliquity of ecliptic — IAU 1980 formula (degrees)
+        T = (t.tt - 2451545.0) / 36525.0
+        eps = 23.439291 - 0.013004 * T
+
+        # Standard ascendant formula
+        ramc = math.radians(ramc_deg)
+        e    = math.radians(eps)
+        phi  = math.radians(lat)
+
+        y = -math.cos(ramc)
+        x =  math.sin(ramc) * math.cos(e) + math.tan(phi) * math.sin(e)
+
+        # atan2(y, x) can return the Descendant (western horizon) when x < 0.
+        # Adding 180° when denominator < 0 gives the correct Ascendant (east).
+        asc_tropical = (math.degrees(math.atan2(y, x)) + (180.0 if x < 0 else 0.0)) % 360
+
+        # Lahiri ayanamsa
+        day_of_year   = utc_dt.timetuple().tm_yday
+        days_in_year  = 366 if utc_dt.year % 4 == 0 else 365
+        decimal_year  = utc_dt.year + (day_of_year / days_in_year)
+        ayanamsa      = self._calculate_ayanamsa(decimal_year)
+
+        asc_sidereal  = (asc_tropical - ayanamsa) % 360
+
+        signs = ["Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+                 "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"]
+        sign         = signs[int(asc_sidereal / 30)]
+        degree_in_sign = asc_sidereal % 30
+
+        return {
+            "longitude":  asc_sidereal,
+            "sign":       sign,
+            "degree":     degree_in_sign,
+            "nakshatra":  self.get_nakshatra(asc_sidereal),
+            "retrograde": False,
+            "speed":      0.0,
         }
 
     def get_sign_name(self, longitude: float) -> str:

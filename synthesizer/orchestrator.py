@@ -1,17 +1,20 @@
 """
-Astrological Orchestrator - Master Agent (Phase 4)
-Synthesizes Math Layer, Logic Layer, and Knowledge Layer using LLM.
+Astrological Orchestrator — H-RAG + Ollama Edition
+=====================================================
+Architecture (Mixture of Experts):
+  1. Math Layer      — EphemerisEngine (Skyfield/NASA JPL, IST input)
+  2. Logic Layer     — Expert agents (Parashara, Nadi, State, Numerology)
+  3. Knowledge Layer — Hierarchical RAG (H-RAG) with local embeddings
+  4. Synthesis Layer — Ollama LLM (fully local, no API key needed)
 """
 
 from datetime import datetime as dt_module
 from typing import Dict, List, Optional, Any
-from pydantic import BaseModel, Field
-import json
+from pydantic import BaseModel, Field, field_validator
 import logging
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 
 # Import our layers
 from engine import EphemerisEngine
@@ -19,7 +22,7 @@ from agents import (
     calculate_aspects,
     get_planet_relationships,
     perform_structural_analysis,
-    get_rag_retriever
+    get_hrag_retriever,          # H-RAG (replaces flat RAG)
 )
 
 # Configure logging
@@ -29,15 +32,28 @@ logger = logging.getLogger(__name__)
 
 class BirthData(BaseModel):
     """Birth data input for chart calculation.
-    
-    IMPORTANT: datetime must be in IST (Indian Standard Time).
-    The system automatically converts to UTC for astronomical calculations.
+
+    IMPORTANT: datetime must be in IST (Indian Standard Time) as a naive datetime
+    (no tzinfo). The system automatically converts to UTC internally for
+    astronomical calculations.
     """
-    datetime: dt_module = Field(description="Date and time of birth (IST - Indian Standard Time)")
+    datetime: dt_module = Field(description="Date and time of birth (IST - Indian Standard Time, naive datetime with no tzinfo)")
     latitude: float = Field(description="Latitude of birth place")
     longitude: float = Field(description="Longitude of birth place")
     location_name: Optional[str] = Field(default=None, description="Name of birth place")
     name: Optional[str] = Field(default=None, description="Person's name")
+
+    @field_validator("datetime")
+    @classmethod
+    def enforce_ist_naive(cls, v: dt_module) -> dt_module:
+        """Reject timezone-aware datetimes. Only naive IST datetimes are accepted."""
+        if v.tzinfo is not None:
+            raise ValueError(
+                "datetime must be a naive IST datetime (no tzinfo). "
+                "Do NOT pass UTC or any timezone-aware datetime. "
+                "Enter the local IST birth time directly, e.g. datetime(1990, 5, 15, 14, 30)."
+            )
+        return v
 
 
 class AstrologicalReading(BaseModel):
@@ -92,16 +108,19 @@ class AstrologicalOrchestrator:
         from agents import NumerologyExpert
         self.numerology_expert = NumerologyExpert()
         
-        # Initialize Knowledge Layer (RAG)
+        # Initialize Knowledge Layer (H-RAG)
         self.use_rag = use_rag
         if use_rag:
             try:
-                logger.info("Initializing Knowledge Layer (RAG)...")
-                self.knowledge_base = get_rag_retriever()
+                logger.info("Initializing Knowledge Layer (H-RAG)...")
+                self.knowledge_base = get_hrag_retriever()
                 kb_stats = self.knowledge_base.get_stats()
-                logger.info(f"Knowledge base ready: {kb_stats['total_chunks']} chunks")
+                logger.info(
+                    f"H-RAG ready: {kb_stats['total_parents']} parents, "
+                    f"{kb_stats['total_children']} children"
+                )
             except Exception as e:
-                logger.warning(f"RAG initialization failed: {e}. Proceeding without RAG.")
+                logger.warning(f"H-RAG initialization failed: {e}. Proceeding without RAG.")
                 self.use_rag = False
                 self.knowledge_base = None
         else:
@@ -138,7 +157,18 @@ class AstrologicalOrchestrator:
         # Section 1: Planetary Positions
         fact_sheet.append("\n1. PLANETARY POSITIONS (Sidereal/Lahiri)")
         fact_sheet.append("-" * 70)
-        
+
+        # Ascendant (Lagna) — first and most important entry
+        asc = mathematical_data.get('_ascendant')
+        if asc:
+            nak = asc['nakshatra']
+            fact_sheet.append(
+                f"   {'Ascendant':12s}: {asc['sign']} {asc['degree']:5.2f}° | "
+                f"{nak['nakshatra_name']:20s} | Pada {nak['pada']} | "
+                f"Ruler: {nak['ruler']}  ◈ LAGNA"
+            )
+            fact_sheet.append("-" * 70)
+
         for planet, data in mathematical_data.items():
             # Skip internal metadata fields
             if planet.startswith('_'):
@@ -353,123 +383,117 @@ class AstrologicalOrchestrator:
         top_k: int = 5
     ) -> List[Dict[str, Any]]:
         """
-        Query the knowledge base for relevant context.
-        
-        Args:
-            mathematical_data: Chart data
-            logical_analysis: Logical analysis results
-            top_k: Number of results to retrieve
-        
-        Returns:
-            List of relevant knowledge chunks
+        Query the H-RAG knowledge base for relevant classical text passages.
+
+        Builds targeted queries from chart features, then uses hierarchical
+        retrieval: child vector search → ranked parent context chunks.
         """
         if not self.use_rag or self.knowledge_base is None:
             return []
-        
-        # Generate smart queries based on chart features
-        queries = []
-        
-        # Query for Moon's nakshatra (most important for personality)
-        moon_nak = mathematical_data['Moon']['nakshatra']['nakshatra_name']
-        queries.append(f"significance and interpretation of {moon_nak} nakshatra")
-        
-        # Query for Ascendant/Lagna if available
-        # (We'll add this in future when we calculate houses)
-        
-        # Query for retrograde planets
+
         structural = logical_analysis.get('structural', {})
+        queries: List[str] = []
+
+        # 1. Moon nakshatra — most important for personality
+        moon_nak = mathematical_data['Moon']['nakshatra']['nakshatra_name']
+        queries.append(f"significance and interpretation of {moon_nak} nakshatra Moon")
+
+        # 2. Retrograde planets
         retro_planets = structural.get('state_analysis', {}).get('retrograde_planets', [])
         if retro_planets:
             retro_names = [p['planet'] for p in retro_planets[:2]]
-            queries.append(f"effects of retrograde {' and '.join(retro_names)}")
-        
-        # Query for dominant element
+            queries.append(f"effects of retrograde {' and '.join(retro_names)} planet")
+
+        # 3. Dominant element
         dominant_element = structural.get('summary', {}).get('dominant_element')
         if dominant_element:
-            queries.append(f"personality traits of {dominant_element} element dominance")
-        
-        # Query for special aspects
-        aspects = logical_analysis.get('aspects', [])
-        if aspects:
-            # Look for Mars or Saturn aspects (most significant)
-            for aspect in aspects[:3]:
-                if 'Mars' in aspect or 'Saturn' in aspect or 'Jupiter' in aspect:
-                    queries.append(f"interpretation of {aspect}")
-                    break
-        
-        # Execute queries and collect results
-        all_results = []
-        seen_content = set()
-        
+            queries.append(f"{dominant_element} element dominance personality Vedic astrology")
+
+        # 4. Key planetary aspects (Mars/Saturn/Jupiter are most significant)
+        for aspect in logical_analysis.get('aspects', [])[:4]:
+            if any(p in aspect for p in ('Mars', 'Saturn', 'Jupiter')):
+                queries.append(f"Vedic astrology interpretation: {aspect}")
+                break
+
+        # 5. Dasha lord
+        dasha_info = mathematical_data.get('_dasha_balance', {})
+        if dasha_info.get('ruler'):
+            queries.append(
+                f"{dasha_info['ruler']} Mahadasha effects Vimshottari Vedic astrology"
+            )
+
+        # Execute hierarchical queries — H-RAG returns parent-level context
+        all_results: List[Dict] = []
+        seen_parents: set = set()
+
         for query in queries:
             try:
-                results = self.knowledge_base.search(query, top_k=2)
-                
-                # Deduplicate
-                for result in results:
-                    content = result['content']
-                    if content not in seen_content:
-                        seen_content.add(content)
+                hits = self.knowledge_base.search(query, top_k=2)
+                for hit in hits:
+                    content = hit['content']
+                    if content not in seen_parents:
+                        seen_parents.add(content)
                         all_results.append({
                             'query': query,
                             'content': content,
-                            'metadata': result.get('metadata', {})
+                            'metadata': hit.get('metadata', {}),
+                            'child_hits': hit.get('child_hits', 1),
                         })
-                
-                # Limit total results
                 if len(all_results) >= top_k:
                     break
-                    
             except Exception as e:
-                logger.warning(f"RAG query failed for '{query}': {e}")
+                logger.warning(f"H-RAG query failed for '{query}': {e}")
                 continue
-        
+
         return all_results[:top_k]
     
     def _create_synthesis_prompt(self) -> ChatPromptTemplate:
         """
-        Create the synthesis prompt template for the LLM.
-        
-        This is the core prompt that guides the LLM to synthesize
-        mathematical facts, logical rules, and textual knowledge.
+        Synthesis prompt — tuned for local Ollama models.
+
+        Ollama models (llama3.2 etc.) work best with:
+        - Clear role definition up front
+        - Explicit numbered sections
+        - Concrete instruction to use provided data
+        - Reasonable output length (they can be verbose)
         """
-        system_message = """You are an expert Vedic Astrologer with deep knowledge of classical texts like Brihat Parashara Hora Shastra, nakshatras, planetary aspects, and yogas.
+        system_message = (
+            "You are an expert Vedic astrologer with deep knowledge of classical texts "
+            "including Brihat Parashara Hora Shastra, Nadi astrology, nakshatras, "
+            "planetary aspects, and yogas.\n\n"
+            "Your task: synthesize the Mathematical Fact Sheet and Classical Text passages "
+            "below into a clear, insightful Vedic astrological reading.\n\n"
+            "RULES:\n"
+            "1. Ground EVERY statement in actual data from the Fact Sheet (planets, "
+            "nakshatras, degrees, aspects, dashas).\n"
+            "2. Use Classical Text passages to deepen and validate interpretations.\n"
+            "3. Apply Nadi rules for personality and character.\n"
+            "4. Apply Parashara rules for life events and timing.\n"
+            "5. Be specific — avoid generic astrology clichés.\n"
+            "6. Keep a balanced tone: acknowledge both strengths and challenges.\n"
+            "7. Target 800–1200 words total."
+        )
 
-Your role is to synthesize mathematical astronomical data, rule-based logical analysis, and classical astrological wisdom into a coherent, insightful reading.
-
-CRITICAL INSTRUCTIONS:
-1. Base all interpretations on the Mathematical Fact Sheet provided
-2. Use the RAG Context (verses and texts) to support and enrich your analysis
-3. Apply Nadi rules for personality, character, and psychological traits
-4. Apply Parashara rules for life events, timing, and predictive analysis
-5. When rules conflict, prioritize Nadi for personality and Parashara for events
-6. Be specific - reference actual planetary positions, nakshatras, and aspects
-7. Avoid generic statements - every point should tie back to the chart data
-8. Maintain a balanced tone - both strengths and challenges
-
-Structure your reading with clear sections."""
-
-        human_message = """Here is the birth chart data to analyze:
-
-MATHEMATICAL FACT SHEET:
-{fact_sheet}
-
-RELEVANT CLASSICAL TEXTS AND VERSES:
-{rag_context}
-
-Based on this data, provide a comprehensive Vedic astrological reading. Include:
-
-1. **Core Personality** (Moon's nakshatra and element analysis)
-2. **Strengths and Talents** (beneficial aspects and placements)
-3. **Challenges and Growth Areas** (difficult aspects, retrograde planets, gandanta)
-4. **Key Life Themes** (based on planetary aspects and yogas)
-5. **Timing Considerations** (based on dasha rulers and nakshatra lords)
-
-Remember: Every statement should be traceable to specific chart features. Synthesize, don't just list facts."""
+        human_message = (
+            "MATHEMATICAL FACT SHEET:\n{fact_sheet}\n\n"
+            "CLASSICAL TEXT PASSAGES (H-RAG retrieved):\n{rag_context}\n\n"
+            "Write a Vedic astrological reading with these five sections:\n\n"
+            "## 1. Core Personality\n"
+            "(Moon nakshatra, dominant element, psychological portrait)\n\n"
+            "## 2. Strengths & Talents\n"
+            "(Beneficial placements, vargottama planets, positive aspects)\n\n"
+            "## 3. Challenges & Growth Areas\n"
+            "(Retrograde planets, difficult aspects, areas needing attention)\n\n"
+            "## 4. Key Life Themes\n"
+            "(Major yogas, planetary pairs, life direction)\n\n"
+            "## 5. Timing & Current Period\n"
+            "(Current Mahadasha/Antardasha, what it activates, near-term outlook)\n\n"
+            "Trace every point back to specific chart data."
+        )
 
         return ChatPromptTemplate.from_messages([
             ("system", system_message),
-            ("human", human_message)
+            ("human", human_message),
         ])
     
     def analyze_chart(self, birth_data: BirthData) -> AstrologicalReading:
@@ -501,8 +525,18 @@ Remember: Every statement should be traceable to specific chart features. Synthe
         mathematical_data['_birth_datetime'] = birth_data.datetime
         logger.info(f"✓ Calculated positions for {len(mathematical_data) - 1} planets")
         
+        # Calculate Ascendant (Lagna)
+        logger.info("Step 1b: Calculating Ascendant (Lagna)...")
+        asc_data = self.engine.calculate_ascendant(
+            birth_data.datetime,
+            birth_data.latitude,
+            birth_data.longitude
+        )
+        mathematical_data['_ascendant'] = asc_data
+        logger.info(f"✓ Ascendant (Lagna): {asc_data['sign']} {asc_data['degree']:.2f}°")
+
         # Calculate Navamsa (D9) for all planets
-        logger.info("Step 1b: Calculating Navamsa (D9) divisional chart...")
+        logger.info("Step 1c: Calculating Navamsa (D9) divisional chart...")
         navamsa_data = {}
         for planet_name, planet_data in mathematical_data.items():
             if not planet_name.startswith('_'):
@@ -564,6 +598,11 @@ Remember: Every statement should be traceable to specific chart features. Synthe
         structural = perform_structural_analysis(planet_data)
         logger.info(f"✓ Nadi: {structural['summary']['total_linked_pairs']} pairs linked")
         logger.info(f"✓ State: {structural['summary']['total_special']} special states found")
+
+        # Pre-calculate dasha balance and store for H-RAG query use
+        moon_lon = mathematical_data['Moon']['longitude']
+        dasha_balance = self.dasha_engine.calculate_dasha_balance(moon_lon, birth_data.datetime)
+        mathematical_data['_dasha_balance'] = dasha_balance
         
         # Combine logical analysis
         logical_analysis = {
@@ -576,14 +615,15 @@ Remember: Every statement should be traceable to specific chart features. Synthe
         # Generate Fact Sheet
         fact_sheet = self._generate_fact_sheet(mathematical_data, logical_analysis)
         
-        # STEP 3: Knowledge Layer (RAG)
-        logger.info("Step 3: Querying knowledge base...")
+        # STEP 3: Knowledge Layer (H-RAG)
+        logger.info("Step 3: Querying H-RAG knowledge base...")
         rag_results = self._query_knowledge_base(mathematical_data, logical_analysis)
-        logger.info(f"✓ Retrieved {len(rag_results)} relevant knowledge chunks")
+        logger.info(f"✓ H-RAG: {len(rag_results)} parent context chunks retrieved")
         
-        # Format RAG context for LLM
+        # Format RAG context for LLM — include child_hits score
         rag_context = "\n\n".join([
-            f"[From {result['metadata'].get('source', 'Unknown')}]\n{result['content']}"
+            f"[Source: {result['metadata'].get('source', 'Unknown')} | "
+            f"Relevance hits: {result.get('child_hits', '?')}]\n{result['content']}"
             for result in rag_results
         ]) if rag_results else "No relevant classical texts found in knowledge base."
         

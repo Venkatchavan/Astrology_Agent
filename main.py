@@ -2,15 +2,16 @@
 Main Orchestrator - Astrological Hybrid Agent
 Entry point for the complete astrological analysis system.
 
-This orchestrates the Mixture of Experts architecture:
-- Math Layer: EphemerisEngine (precise calculations)
-- Logic Layer: Expert agents (rule-based analysis)
-- Knowledge Layer: RAG system (domain knowledge)
-- Synthesis Layer: LLM (interpretation)
+Architecture (Mixture of Experts + H-RAG + Ollama):
+- Math Layer:      EphemerisEngine (Skyfield/NASA JPL, IST input)
+- Logic Layer:     Expert agents (Parashara, Nadi, Numerology)
+- Knowledge Layer: H-RAG (Hierarchical RAG, ChromaDB, local embeddings)
+- Synthesis Layer: Ollama LLM (fully local, no API key required)
 """
 
 import os
 import sys
+import subprocess
 from datetime import datetime
 from pathlib import Path
 import logging
@@ -32,116 +33,79 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _list_ollama_models() -> list:
+    """Return names of locally available Ollama models."""
+    try:
+        result = subprocess.run(
+            ["ollama", "list"],
+            capture_output=True, text=True, timeout=6
+        )
+        lines = result.stdout.strip().split('\n')
+        # Skip header row, grab the model name (first column)
+        return [
+            line.split()[0]
+            for line in lines[1:]
+            if line.strip() and line.split()
+        ]
+    except Exception:
+        return []
+
+
 def initialize_llm(model: str = "auto", temperature: float = 0.7):
     """
-    Initialize the LLM for synthesis.
-    Auto-detects available API keys: Google Gemini > OpenAI > Anthropic
-    
+    Initialize a fully local Ollama LLM for synthesis.
+
+    Ollama must be running (it starts automatically on macOS).
+    To pull a model: ollama pull llama3.2
+
     Args:
-        model: Model name (e.g., 'gemini-1.5-flash', 'gpt-4', 'claude-3-sonnet') or 'auto'
-        temperature: Temperature for generation
-    
+        model: Ollama model name, or 'auto' to pick the best available.
+        temperature: Sampling temperature (0.0 – 1.0).
+
     Returns:
-        LangChain LLM instance or None if initialization fails
+        LangChain ChatOllama instance, or None on failure.
     """
-    # Auto-detect available API keys
+    available = _list_ollama_models()
+
+    if not available:
+        logger.error(
+            "No Ollama models found. Pull one first:\n"
+            "  ollama pull llama3.2\n"
+            "Then re-run the analysis."
+        )
+        return None
+
+    # Auto-select: prefer quality models for long-form generation
+    PREFERRED = ["llama3.2", "llama3.1", "mistral", "gemma3", "phi3", "qwen2.5"]
+
     if model == "auto":
-        if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
-            model = "gemini-2.5-flash"
-            logger.info("Auto-detected: Using Google Gemini")
-        elif os.getenv("OPENAI_API_KEY"):
-            model = "gpt-4o-mini"
-            logger.info("Auto-detected: Using OpenAI")
-        elif os.getenv("ANTHROPIC_API_KEY"):
-            model = "claude-3-sonnet-20240229"
-            logger.info("Auto-detected: Using Anthropic Claude")
-        else:
-            logger.warning("No API key found. Set one of:")
-            logger.warning("  - GOOGLE_API_KEY or GEMINI_API_KEY (Gemini - Free tier available)")
-            logger.warning("  - OPENAI_API_KEY (GPT models)")
-            logger.warning("  - ANTHROPIC_API_KEY (Claude models)")
-            return None
-    
-    # Initialize Gemini
-    if model.startswith("gemini"):
-        try:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            
-            api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-            if not api_key:
-                logger.warning("GOOGLE_API_KEY or GEMINI_API_KEY not found")
-                return None
-            
-            llm = ChatGoogleGenerativeAI(
-                model=model,
-                temperature=temperature,
-                google_api_key=api_key
-            )
-            
-            logger.info(f"✓ Initialized Google Gemini ({model}) with temperature {temperature}")
-            return llm
-            
-        except ImportError:
-            logger.warning("langchain-google-genai not installed")
-            logger.warning("Install with: pip install langchain-google-genai")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to initialize Gemini: {e}")
-            return None
-    
-    # Initialize OpenAI
-    elif model.startswith("gpt"):
-        try:
-            from langchain_openai import ChatOpenAI
-            
-            if not os.getenv("OPENAI_API_KEY"):
-                logger.warning("OPENAI_API_KEY not found in environment")
-                return None
-            
-            llm = ChatOpenAI(
-                model=model,
-                temperature=temperature
-            )
-            
-            logger.info(f"✓ Initialized OpenAI ({model}) with temperature {temperature}")
-            return llm
-            
-        except ImportError:
-            logger.warning("langchain-openai not installed")
-            logger.warning("Install with: pip install langchain-openai")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to initialize OpenAI: {e}")
-            return None
-    
-    # Initialize Anthropic
-    elif model.startswith("claude"):
-        try:
-            from langchain_anthropic import ChatAnthropic
-            
-            if not os.getenv("ANTHROPIC_API_KEY"):
-                logger.warning("ANTHROPIC_API_KEY not found in environment")
-                return None
-            
-            llm = ChatAnthropic(
-                model=model,
-                temperature=temperature
-            )
-            
-            logger.info(f"✓ Initialized Anthropic Claude ({model}) with temperature {temperature}")
-            return llm
-            
-        except ImportError:
-            logger.warning("langchain-anthropic not installed")
-            logger.warning("Install with: pip install langchain-anthropic")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to initialize Anthropic: {e}")
-            return None
-    
-    else:
-        logger.error(f"Unknown model: {model}")
-        logger.info("Supported models: gemini-1.5-flash, gpt-4o-mini, claude-3-sonnet-20240229")
+        model = available[0]  # fallback
+        for preferred in PREFERRED:
+            for m in available:
+                if preferred in m.lower():
+                    model = m
+                    break
+            else:
+                continue
+            break
+
+    if model not in available:
+        logger.warning(
+            f"Model '{model}' not found locally. Available: {available}\n"
+            f"Falling back to: {available[0]}"
+        )
+        model = available[0]
+
+    try:
+        from langchain_ollama import ChatOllama
+        llm = ChatOllama(model=model, temperature=temperature)
+        logger.info(f"✓ Initialized Ollama LLM: {model} (temperature={temperature})")
+        return llm
+    except ImportError:
+        logger.error("langchain-ollama not installed. Run: pip install langchain-ollama")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to initialize Ollama ({model}): {e}")
         return None
 
 
@@ -153,7 +117,8 @@ def run_analysis(
     name: str = None,
     use_llm: bool = True,
     use_rag: bool = True,
-    output_file: str = None
+    output_file: str = None,
+    model: str = "auto"
 ):
     """
     Run complete astrological analysis.
@@ -175,7 +140,7 @@ def run_analysis(
     # Initialize LLM
     llm = None
     if use_llm:
-        llm = initialize_llm()
+        llm = initialize_llm(model=model)
         if llm is None:
             logger.warning("Proceeding without LLM - will output fact sheet only")
     
@@ -184,7 +149,7 @@ def run_analysis(
     orchestrator = AstrologicalOrchestrator(
         llm=llm,
         data_dir="data",
-        docs_dir="docs",
+        docs_dir="data/pdfs",
         use_rag=use_rag
     )
     
@@ -227,33 +192,17 @@ def run_analysis(
     logger.info("=" * 70)
     print("\n" + reading.synthesis)
     
-    # Save to file if requested
-    if output_file:
-        logger.info(f"\nSaving output to {output_file}...")
-        
-        output = []
-        output.append("=" * 70)
-        output.append("ASTROLOGICAL READING")
-        output.append("=" * 70)
-        
-        if name:
-            output.append(f"\nName: {name}")
-        output.append(f"Birth: {dt.strftime('%Y-%m-%d %H:%M')} IST")
-        output.append(f"Location: {lat}°N, {lon}°E")
-        if location_name:
-            output.append(f"Place: {location_name}")
-        
-        output.append("\n" + reading.fact_sheet)
-        output.append("\n" + "=" * 70)
-        output.append("INTERPRETATION")
-        output.append("=" * 70)
-        output.append("\n" + reading.synthesis)
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(output))
-        
-        logger.info(f"✓ Saved to {output_file}")
-    
+    # ── Auto-save to output/<name>_<date>_<time>.md ──────────────────────────
+    _save_markdown(
+        reading=reading,
+        dt=dt,
+        lat=lat,
+        lon=lon,
+        name=name,
+        location_name=location_name,
+        override_path=output_file,
+    )
+
     logger.info("\n" + "=" * 70)
     logger.info("ANALYSIS COMPLETE")
     logger.info("=" * 70)
@@ -261,31 +210,213 @@ def run_analysis(
     return reading
 
 
+def _generate_south_indian_chart(mathematical_data, name=None):
+    """
+    Generate a South Indian (square grid, fixed signs) Rasi chart in ASCII art.
+    Planets are placed in their respective sign houses.
+
+    South Indian layout (signs fixed, anti-clockwise from top-left):
+        Pisces  | Aries  | Taurus | Gemini
+        Aquarius|  [center merged]  | Cancer
+        Capric. |  [center merged]  | Leo
+        Sagitt. | Scorpio| Libra  | Virgo
+    """
+    W  = 13          # content width per cell
+    CW = 2 * W + 1   # merged center content width = 27
+
+    SIGN_NAMES = [
+        "Aries", "Taurus", "Gemini", "Cancer",
+        "Leo", "Virgo", "Libra", "Scorpio",
+        "Sagittarius", "Capricorn", "Aquarius", "Pisces",
+    ]
+    PLANET_ABBR = {
+        "Sun": "Su", "Moon": "Mo", "Mercury": "Me",
+        "Venus": "Ve", "Mars": "Ma", "Jupiter": "Ju",
+        "Saturn": "Sa", "Rahu": "Ra", "Ketu": "Ke",
+    }
+
+    # Ascendant (Lagna) sign index
+    asc_data     = mathematical_data.get('_ascendant')
+    asc_sign_idx = int(asc_data['longitude'] / 30) % 12 if asc_data else None
+
+    # Group planets by sign index (0=Aries … 11=Pisces)
+    sign_planets: dict = {i: [] for i in range(12)}
+    for planet, data in mathematical_data.items():
+        if planet.startswith('_'):
+            continue
+        lon      = data.get('longitude', 0)
+        sign_idx = int(lon / 30) % 12
+        retro    = "(R)" if data.get('retrograde', False) else ""
+        abbr     = PLANET_ABBR.get(planet, planet[:2])
+        sign_planets[sign_idx].append(f"{abbr}{retro}")
+
+    def cell(sign_idx):
+        """2-line cell: [sign name (◈ if lagna), planet list]."""
+        sign    = SIGN_NAMES[sign_idx]
+        is_lagna = (sign_idx == asc_sign_idx)
+        # Mark lagna sign name with ◈
+        if is_lagna:
+            label = (sign[:W - 2] + " ◈").center(W)
+        else:
+            label = sign[:W].center(W)
+        planets = " ".join(sign_planets[sign_idx])
+        if is_lagna and planets:
+            planets = "Asc " + planets
+        elif is_lagna:
+            planets = "Asc"
+        if len(planets) > W:
+            planets = planets[:W - 1] + "\u2026"   # ellipsis if overflow
+        return [label, planets.center(W)]
+
+    # ── Border templates (all exactly 57 chars wide) ─────────────────────
+    top         = "\u250c" + ("\u2500" * W + "\u252c") * 3 + "\u2500" * W + "\u2510"
+    sep_full    = "\u251c" + ("\u2500" * W + "\u253c") * 3 + "\u2500" * W + "\u2524"
+    sep_merge_t = "\u251c" + "\u2500" * W + "\u253c" + "\u2500" * CW + "\u253c" + "\u2500" * W + "\u2524"
+    sep_merge_m = "\u251c" + "\u2500" * W + "\u2524" + " " * CW + "\u251c" + "\u2500" * W + "\u2524"
+    sep_merge_b = "\u251c" + "\u2500" * W + "\u253c" + "\u2500" * W + "\u252c" + "\u2500" * W + "\u253c" + "\u2500" * W + "\u2524"
+    bot         = "\u2514" + ("\u2500" * W + "\u2534") * 3 + "\u2500" * W + "\u2518"
+
+    def row4(signs):
+        """Two content lines for a 4-cell row."""
+        cells = [cell(s) for s in signs]
+        return [
+            "\u2502" + "\u2502".join(c[0] for c in cells) + "\u2502",
+            "\u2502" + "\u2502".join(c[1] for c in cells) + "\u2502",
+        ]
+
+    # ── Center section content ────────────────────────────────────────────
+    title1 = "SOUTH INDIAN RASI".center(CW)
+    title2 = (name or "Birth Chart").center(CW)
+    blank  = " " * CW
+
+    aq = cell(10)   # Aquarius  — row 2, col 1
+    ca = cell(3)    # Cancer    — row 2, col 4
+    cp = cell(9)    # Capricorn — row 3, col 1
+    le = cell(4)    # Leo       — row 3, col 4
+
+    chart = []
+    chart.append(top)
+    chart.extend(row4([11, 0, 1, 2]))        # Pisces | Aries | Taurus | Gemini
+    chart.append(sep_merge_t)
+    chart.append("\u2502" + aq[0] + "\u2502" + title1 + "\u2502" + ca[0] + "\u2502")
+    chart.append("\u2502" + aq[1] + "\u2502" + title2 + "\u2502" + ca[1] + "\u2502")
+    chart.append(sep_merge_m)
+    chart.append("\u2502" + cp[0] + "\u2502" + blank   + "\u2502" + le[0] + "\u2502")
+    chart.append("\u2502" + cp[1] + "\u2502" + blank   + "\u2502" + le[1] + "\u2502")
+    chart.append(sep_merge_b)
+    chart.extend(row4([8, 7, 6, 5]))         # Sagittarius | Scorpio | Libra | Virgo
+    chart.append(bot)
+
+    return "\n".join(chart)
+
+
+def _save_markdown(reading, dt, lat, lon, name, location_name, override_path=None):
+    """
+    Always save a rich Markdown report to output/<slug>_<YYYYMMDD>_<HHMM>.md.
+    If override_path is given, save there instead (but still as .md).
+    """
+    import re as _re
+    from datetime import datetime as _dt
+    from pathlib import Path as _Path
+
+    # Build filename slug
+    name_slug = _re.sub(r'[^a-zA-Z0-9]+', '_', (name or "chart")).strip('_').lower()
+    timestamp = dt.strftime("%Y%m%d_%H%M")
+
+    if override_path:
+        out_path = _Path(override_path)
+        if not out_path.suffix:
+            out_path = out_path.with_suffix('.md')
+    else:
+        out_dir = _Path("output")
+        out_dir.mkdir(exist_ok=True)
+        out_path = out_dir / f"{name_slug}_{timestamp}.md"
+
+    # ── Build Markdown ─────────────────────────────────────────────────────
+    generated_at = _dt.now().strftime("%Y-%m-%d %H:%M")
+    display_name = name or "—"
+    display_place = location_name or "—"
+
+    # South Indian Rasi chart diagram
+    rasi_chart = _generate_south_indian_chart(reading.mathematical_data, name=display_name)
+
+    lines = [
+        f"# Vedic Astrological Reading — {display_name}",
+        "",
+        "| Field | Value |",
+        "|-------|-------|",
+        f"| **Name** | {display_name} |",
+        f"| **Date & Time (IST)** | {dt.strftime('%Y-%m-%d %H:%M')} |",
+        f"| **Latitude / Longitude** | {lat}°N, {lon}°E |",
+        f"| **Birth Place** | {display_place} |",
+        f"| **Generated** | {generated_at} |",
+        "",
+        "---",
+        "",
+        "## Rasi Chart (South Indian Style)",
+        "",
+        "```",
+        rasi_chart,
+        "```",
+        "",
+        "---",
+        "",
+        "## Chart Data",
+        "",
+        "```",
+        reading.fact_sheet.strip(),
+        "```",
+        "",
+        "---",
+        "",
+        "## Interpretation",
+        "",
+        reading.synthesis.strip(),
+        "",
+        "---",
+        "",
+        "*Generated by Astrology Agent — H-RAG + Ollama (llama3.2) — Fully Local, No API Key*",
+    ]
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info(f"✓ Markdown saved → {out_path}")
+    return out_path
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Astrological Hybrid Agent - Vedic Chart Analysis (IST-Based)",
+        description="Astrological Hybrid Agent — Vedic Chart Analysis (H-RAG + Ollama, IST-Based)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples (ALL inputs and calculations in IST - Indian Standard Time):
-  # Basic analysis
+Fully LOCAL — no API keys required. Uses Ollama for LLM synthesis.
+
+Prerequisites:
+  ollama pull llama3.2          # (one-time, ~2 GB)
+  python ingest_knowledge.py    # ingest PDF books into H-RAG (optional)
+
+Examples (ALL times in IST — Indian Standard Time):
+  # Basic analysis (auto-selects best available Ollama model)
   python main.py --date "2025-12-15" --time "12:00" --lat 28.6139 --lon 77.2090
-  
-  # Full analysis with details
+
+  # Full analysis with name + location + file output
   python main.py --date "1990-05-15" --time "14:30" --lat 19.0760 --lon 72.8777 \\
-                 --name "John Doe" --location "Mumbai" --output reading.txt
-  
-  # India Independence (midnight IST)
-  python main.py --date "1947-08-15" --time "00:00" --lat 28.6139 --lon 77.2090 \\
-                 --name "India Independence" --location "New Delhi"
-  
-  # Without LLM (fact sheet only, faster)
+                 --name "Arjun Sharma" --location "Mumbai" --output reading.txt
+
+  # Choose a specific Ollama model
+  python main.py --date "1990-05-15" --time "14:30" --lat 13.0827 --lon 80.2707 \\
+                 --name "Test User" --location "Chennai" --model llama3.2
+
+  # Fact sheet only (no LLM, fastest)
   python main.py --date "2025-12-15" --time "12:00" --lat 28.6139 --lon 77.2090 \\
                  --no-llm
-  
-  # Save output to file
-  python main.py --date "1995-07-10" --time "08:15" --lat 12.9716 --lon 77.5946 \\
-                 --name "Personal Chart" --location "Bengaluru" --output my_chart.txt
+
+  # Skip RAG (useful when no PDFs ingested yet)
+  python main.py --date "1990-05-15" --time "14:30" --lat 13.0827 --lon 80.2707 \\
+                 --name "Test User" --location "Chennai" --no-rag
+
+  # List available Ollama models
+  ollama list
         """
     )
     
@@ -336,6 +467,12 @@ Examples (ALL inputs and calculations in IST - Indian Standard Time):
         action='store_true',
         help='Disable RAG knowledge retrieval'
     )
+    parser.add_argument(
+        '--model',
+        default='auto',
+        help='Ollama model name to use (default: auto-selects best available). '
+             'Examples: llama3.2, llama3.1, mistral. Run "ollama list" to see options.'
+    )
     
     args = parser.parse_args()
     
@@ -371,7 +508,8 @@ Examples (ALL inputs and calculations in IST - Indian Standard Time):
             name=args.name,
             use_llm=not args.no_llm,
             use_rag=not args.no_rag,
-            output_file=args.output
+            output_file=args.output,
+            model=args.model
         )
     except Exception as e:
         logger.error(f"Analysis failed: {e}", exc_info=True)

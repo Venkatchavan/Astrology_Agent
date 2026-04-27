@@ -26,6 +26,12 @@ de421.bsp
 # VS Code
 .vscode/
 
+# Output files (generated reports)
+output/
+
+# Large PDF knowledge base files (not needed in repo)
+data/pdfs/*.pdf
+
 # OS
 .DS_Store
 Thumbs.db

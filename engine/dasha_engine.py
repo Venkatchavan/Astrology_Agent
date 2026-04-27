@@ -28,7 +28,7 @@ class DashaEngine:
         
         Args:
             moon_longitude_deg: Sidereal longitude of Moon (0-360)
-            birth_date: Date and time of birth (UTC)
+            birth_date: Date and time of birth (IST - Indian Standard Time)
         
         Returns:
             Dictionary with ruler, balance string, end date, and remaining fraction
@@ -226,7 +226,7 @@ class DashaEngine:
             
             # Formula: (Major * Sub) / 120 = SubPeriod Length in Years
             sub_length_years = (md_years * ad_years) / 120.0
-            sub_end = running_date + timedelta(days=sub_length_years * 365.25)
+            sub_end = running_date + timedelta(days=sub_length_years * 365.2422)
             
             if target_date <= sub_end:
                 return {

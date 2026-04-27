@@ -105,6 +105,12 @@ class EphemerisEngine:
         """
         # Convert IST to UTC (subtract 5 hours 30 minutes)
         # Swiss Ephemeris REQUIRES UTC for accurate calculations
+        if dt.tzinfo is not None:
+            raise ValueError(
+                "datetime must be a naive IST datetime (no tzinfo). "
+                "Do NOT pass UTC or any timezone-aware datetime. "
+                "Pass the local IST birth time directly."
+            )
         utc_dt = dt - timedelta(hours=5, minutes=30)
         
         # Convert UTC datetime to Julian Day
