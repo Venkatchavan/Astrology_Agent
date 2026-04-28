@@ -17,7 +17,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 # Import our layers
-from engine import EphemerisEngine
+from engine import EphemerisEngine, PredictionEngine
 from agents import (
     calculate_aspects,
     get_planet_relationships,
@@ -64,6 +64,8 @@ class AstrologicalReading(BaseModel):
     rag_context: List[Dict[str, Any]]
     synthesis: str
     fact_sheet: str
+    prediction_brief: Optional[Dict[str, Any]] = Field(default=None)
+    report_sections: Optional[Dict[str, str]] = Field(default=None)
 
 
 class AstrologicalOrchestrator:
@@ -100,7 +102,10 @@ class AstrologicalOrchestrator:
         # Initialize Dasha Engine
         from engine import DashaEngine, NumerologyEngine
         self.dasha_engine = DashaEngine()
-        
+
+        # Initialize Prediction Engine (pre-computes all reasoning for LLM sections)
+        self.prediction_engine = PredictionEngine(self.engine, self.dasha_engine)
+
         # Initialize Numerology Engine
         self.numerology_engine = NumerologyEngine(data_dir=data_dir)
         
@@ -495,7 +500,445 @@ class AstrologicalOrchestrator:
             ("system", system_message),
             ("human", human_message),
         ])
-    
+
+    # ─── Domain-specific H-RAG queries ───────────────────────────────────────
+
+    def _query_knowledge_per_domain(
+        self,
+        prediction_brief: Dict[str, Any],
+        mathematical_data: Dict[str, Any],
+        logical_analysis: Dict[str, Any],
+    ) -> Dict[str, str]:
+        """
+        Build targeted H-RAG context strings per domain.
+        Returns {domain_key: context_text} for use in section prompts.
+        """
+        if not self.use_rag or self.knowledge_base is None:
+            return {}
+
+        brief = prediction_brief
+        lagna = brief.get("lagna", "")
+        lagna_lord = brief.get("lagna_lord", "")
+        ph = brief.get("planet_houses", {})
+        ps = brief.get("planet_strengths", {})
+
+        def _moon_nak() -> str:
+            return mathematical_data.get("Moon", {}).get("nakshatra", {}).get("nakshatra_name", "")
+
+        def _query(q: str) -> str:
+            try:
+                hits = self.knowledge_base.search(q, top_k=2)
+                parts = []
+                for h in hits:
+                    src = h.get("metadata", {}).get("source", "H-RAG")
+                    parts.append(f"[{src}] {h['content']}")
+                return "\n\n".join(parts)
+            except Exception:
+                return ""
+
+        results: Dict[str, str] = {}
+
+        results["personality"] = _query(
+            f"{lagna} ascendant {lagna_lord} lord personality Vedic astrology"
+        )
+        results["moon"] = _query(
+            f"{_moon_nak()} nakshatra Moon mind emotions Vedic astrology"
+        )
+        results["sun"] = _query(
+            f"Sun in house {ph.get('Sun', '?')} identity authority Vedic astrology"
+        )
+        results["career"] = _query(
+            f"10th house career {brief['domains']['career']['house_lord']} lord Vedic astrology profession"
+        )
+        results["wealth"] = _query(
+            f"2nd 11th house wealth income gains Vedic astrology Jupiter Venus"
+        )
+        results["relationships"] = _query(
+            f"7th house Venus marriage partner love {lagna} lagna Vedic astrology"
+        )
+        results["health"] = _query(
+            f"lagna lord health vitality {lagna} Vedic astrology 6th house"
+        )
+        results["spirituality"] = _query(
+            f"Ketu 9th 12th house spiritual liberation dharma Vedic astrology"
+        )
+        results["dasha"] = _query(
+            f"{brief['life_phase']['mahadasha']} mahadasha effects Vimshottari period Vedic"
+        )
+
+        # Retrograde planets context
+        retro = [p for p, d in ps.items() if d.get("retrograde")]
+        if retro:
+            results["retrograde"] = _query(
+                f"retrograde {retro[0]} planet karmic effects Vedic astrology"
+            )
+
+        return results
+
+    # ─── Section-by-section LLM synthesis ────────────────────────────────────
+
+    def _generate_section(
+        self,
+        section_label: str,
+        instructions: str,
+        facts: str,
+        hrag_context: str = "",
+    ) -> str:
+        """
+        Call the LLM for one focused report section.
+        Supplies pre-computed facts so the LLM only writes prose.
+        """
+        if self.llm is None:
+            return ""
+
+        system = (
+            "You are an experienced Vedic astrology report writer. "
+            "Write clearly, specifically, and practically. "
+            "Use ONLY the chart facts provided — never invent placements or statistics. "
+            "Do not use vague filler phrases. Every sentence must reference a specific chart indicator."
+        )
+        human = (
+            f"## Section: {section_label}\n\n"
+            f"### Chart Facts (use these exactly)\n{facts}\n\n"
+            + (f"### Classical / Knowledge-Base Context\n{hrag_context}\n\n" if hrag_context else "")
+            + f"### Instructions\n{instructions}"
+        )
+
+        try:
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", system),
+                ("human", human),
+            ])
+            chain = prompt | self.llm | StrOutputParser()
+            return chain.invoke({}).strip()
+        except Exception as e:
+            logger.warning(f"Section '{section_label}' LLM call failed: {e}")
+            return f"[Section generation failed: {e}]"
+
+    def _generate_sections(
+        self,
+        prediction_brief: Dict[str, Any],
+        domain_rag: Dict[str, str],
+        birth_data: "BirthData",
+        mathematical_data: Dict[str, Any],
+    ) -> Dict[str, str]:
+        """
+        Generate all prose sections of the 14-section report.
+        Returns {section_key: prose_text}.
+        """
+        b = prediction_brief
+        lagna = b["lagna"]
+        ll = b["lagna_lord"]
+        lp = b["life_phase"]
+        dt = b["dasha_timeline"]
+        current = dt.get("current", {})
+        md = current.get("mahadasha", "")
+        ad = current.get("antardasha", "")
+
+        def _brief_planet(planet: str) -> str:
+            ps = b["planet_strengths"].get(planet, {})
+            ph = b["planet_houses"].get(planet, "?")
+            return (
+                f"{planet}: {ps.get('sign', '?')} {ps.get('degree', 0):.1f}°, "
+                f"House {ph}, {ps.get('overall', 'Neutral')}"
+                + (f" ({', '.join(ps.get('status_list', []))})" if ps.get("status_list") else "")
+            )
+
+        def _domain_facts(domain: str) -> str:
+            d = b["domains"].get(domain, {})
+            lines = []
+            for item in d.get("supporting", []):
+                mark = "✓" if item.get("supports") else "✗"
+                lines.append(f"{mark} {item['point']}")
+            lines.append(f"Confidence: {d.get('confidence', '?')}")
+            lines.append(f"Dasha Relevance: {d.get('dasha_relevance', '?')}")
+            return "\n".join(lines)
+
+        sections: Dict[str, str] = {}
+        logger.info("Generating report sections with LLM...")
+
+        # ── Executive Summary (2.2 + 2.3) ────────────────────────────────────
+        top_themes_text = "\n".join(
+            f"- {t['theme']} ({t['strength']}): {t['evidence'][0]}"
+            for t in b["top_themes"]
+        )
+        facts_exec = (
+            f"Lagna: {lagna} | Lagna Lord: {ll} ({b['planet_strengths'].get(ll, {}).get('overall', '?')})\n"
+            f"Moon: {_brief_planet('Moon')}\n"
+            f"Sun: {_brief_planet('Sun')}\n"
+            f"Current Period: {md} Mahadasha / {ad} Antardasha (ends {current.get('end_date', '?')})\n"
+            f"Phase nature: {lp['phase_type']}\n"
+            f"Top themes:\n{top_themes_text}\n"
+            f"Yogas: {', '.join(y['name'] for y in b['yogas'][:4]) or 'None detected'}"
+        )
+        sections["executive_summary"] = self._generate_section(
+            "2.2–2.3 Executive Summary",
+            (
+                "Write a 150–220 word paragraph (section 2.2) summarising the native's personality, "
+                "life direction, karmic themes, and near-term outlook. Be specific, not generic. "
+                "Then write a Current Phase Verdict (section 2.3) as 3–5 bullet points covering: "
+                "current dasha nature, most activated life areas, and best strategy."
+            ),
+            facts_exec,
+            domain_rag.get("personality", "") + "\n\n" + domain_rag.get("moon", ""),
+        )
+        logger.info("  ✓ Executive summary")
+
+        # ── Chart Foundation 4.1 Lagna ────────────────────────────────────────
+        lagna_nak = b.get("lagna_nakshatra", {})
+        facts_lagna = (
+            f"Ascendant: {lagna} {b['lagna_degree']:.2f}° "
+            f"({lagna_nak.get('nakshatra_name', '?')} Pada {lagna_nak.get('pada', '?')})\n"
+            f"Lagna Lord: {ll} in House {b['planet_houses'].get(ll, '?')} "
+            f"({b['planet_strengths'].get(ll, {}).get('sign', '?')}), "
+            f"{b['planet_strengths'].get(ll, {}).get('overall', '?')}\n"
+            f"Aspects on Lagna lord: see aspects list"
+        )
+        sections["lagna_personality"] = self._generate_section(
+            "4.1 Lagna-Based Personality",
+            (
+                "Write 120–180 words explaining how this Ascendant sign, its nakshatra, and the "
+                "condition of the Lagna lord shape the native's temperament, physical energy, "
+                "decision-making style, social approach, and life orientation. Be specific to "
+                "this exact sign — avoid generic descriptions."
+            ),
+            facts_lagna,
+            domain_rag.get("personality", ""),
+        )
+        logger.info("  ✓ Lagna personality")
+
+        # ── Chart Foundation 4.2 Moon ─────────────────────────────────────────
+        moon_ps = b["planet_strengths"].get("Moon", {})
+        moon_nak = mathematical_data.get("Moon", {}).get("nakshatra", {})
+        facts_moon = (
+            f"Moon: {moon_ps.get('sign', '?')} {moon_ps.get('degree', 0):.1f}°, "
+            f"House {b['planet_houses'].get('Moon', '?')}\n"
+            f"Moon Nakshatra: {moon_nak.get('nakshatra_name', '?')} Pada {moon_nak.get('pada', '?')}, "
+            f"Ruler {moon_nak.get('ruler', '?')}\n"
+            f"Moon Strength: {moon_ps.get('overall', 'Neutral')} "
+            f"({', '.join(moon_ps.get('status_list', ['—']))})"
+        )
+        sections["moon_mind"] = self._generate_section(
+            "4.2 Moon-Based Mind and Emotional Pattern",
+            (
+                "Write 120–150 words on this Moon's emotional nature, mental pattern, "
+                "need for comfort/security, stress response, and relationship with intuition. "
+                "Reference the specific Moon nakshatra and its meaning."
+            ),
+            facts_moon,
+            domain_rag.get("moon", ""),
+        )
+        logger.info("  ✓ Moon mind")
+
+        # ── Chart Foundation 4.3 Sun ──────────────────────────────────────────
+        sun_ps = b["planet_strengths"].get("Sun", {})
+        sun_nak = mathematical_data.get("Sun", {}).get("nakshatra", {})
+        facts_sun = (
+            f"Sun: {sun_ps.get('sign', '?')} {sun_ps.get('degree', 0):.1f}°, "
+            f"House {b['planet_houses'].get('Sun', '?')}\n"
+            f"Sun Nakshatra: {sun_nak.get('nakshatra_name', '?')} Pada {sun_nak.get('pada', '?')}\n"
+            f"Sun Strength: {sun_ps.get('overall', 'Neutral')} "
+            f"({', '.join(sun_ps.get('status_list', ['—']))})"
+        )
+        sections["sun_identity"] = self._generate_section(
+            "4.3 Sun-Based Identity and Authority",
+            (
+                "Write 80–120 words on this Sun placement's effect on confidence, leadership "
+                "style, relationship with authority/father, public identity, and ego development."
+            ),
+            facts_sun,
+            domain_rag.get("sun", ""),
+        )
+        logger.info("  ✓ Sun identity")
+
+        # ── Strengths (5.2 Talents) ───────────────────────────────────────────
+        strong_planets = [
+            p for p, d in b["planet_strengths"].items()
+            if d.get("overall") == "Strong"
+        ]
+        vargottama = [p for p, d in b["planet_strengths"].items() if d.get("vargottama")]
+        yogas_text = "\n".join(
+            f"- {y['name']}: {y['description']}" for y in b["yogas"]
+        ) or "None detected"
+        facts_strengths = (
+            f"Strong planets: {', '.join(strong_planets) or 'None'}\n"
+            f"Vargottama (D1=D9): {', '.join(vargottama) or 'None'}\n"
+            f"Yogas:\n{yogas_text}\n\n"
+            + "\n".join(_brief_planet(p) for p in strong_planets[:4])
+        )
+        sections["strengths"] = self._generate_section(
+            "5.2 Natural Talents",
+            (
+                "Write 2–4 talent cards in this format:\n"
+                "### Talent N: [Name]\n"
+                "- **Prediction:** [clear statement]\n"
+                "- **Chart Evidence:** [planet/sign/house/yoga]\n"
+                "- **How it manifests:** [real-world behaviour]\n"
+                "- **Best use:** [career/life application]\n"
+                "- **Confidence:** High / Medium / Low\n\n"
+                "Base each talent on a strong planet, yoga, or vargottama listed in facts."
+            ),
+            facts_strengths,
+            "",
+        )
+        logger.info("  ✓ Strengths")
+
+        # ── Challenges (6.2 Shadow Pattern) ──────────────────────────────────
+        weak_planets = [
+            p for p, d in b["planet_strengths"].items()
+            if d.get("overall") == "Weakened"
+        ]
+        retro_planets = [
+            p for p, d in b["planet_strengths"].items()
+            if d.get("retrograde")
+        ]
+        facts_challenges = (
+            f"Weakened planets: {', '.join(weak_planets) or 'None'}\n"
+            f"Retrograde planets: {', '.join(retro_planets) or 'None'}\n"
+            + "\n".join(_brief_planet(p) for p in (weak_planets + retro_planets)[:4])
+        )
+        sections["challenges"] = self._generate_section(
+            "6.2 Psychological Shadow Pattern",
+            (
+                "Write 100–150 words about this native's likely behavioural patterns to watch: "
+                "emotional blocks, repeated friction, delay patterns, or overthinking. "
+                "Base it on weak/retrograde planets only — do not fabricate challenges."
+            ),
+            facts_challenges,
+            domain_rag.get("retrograde", ""),
+        )
+        logger.info("  ✓ Challenges")
+
+        # ── Career (7.1) ──────────────────────────────────────────────────────
+        sections["career"] = self._generate_section(
+            "7.1 Career and Professional Growth",
+            (
+                "Write a career prediction covering: main career direction, suitable fields, "
+                "leadership style, timing (from dasha), and a 2–3 sentence final verdict. "
+                "Reference the 10th house, 10th lord, and Sun placement specifically."
+            ),
+            _domain_facts("career") + "\n\n" + "\n".join(
+                _brief_planet(p) for p in ["Sun", "Saturn", "Mercury", "Mars"]
+            ),
+            domain_rag.get("career", ""),
+        )
+        logger.info("  ✓ Career")
+
+        # ── Wealth (7.3) ──────────────────────────────────────────────────────
+        sections["wealth"] = self._generate_section(
+            "7.3 Wealth, Finance, and Assets",
+            (
+                "Write a wealth prediction covering: earning style, saving tendency, "
+                "risk appetite, best wealth-building periods, and caution periods. "
+                "Reference 2nd house, 11th house, Jupiter and Venus specifically."
+            ),
+            _domain_facts("wealth") + "\n\n" + "\n".join(
+                _brief_planet(p) for p in ["Jupiter", "Venus", "Mercury"]
+            ),
+            domain_rag.get("wealth", ""),
+        )
+        logger.info("  ✓ Wealth")
+
+        # ── Relationships (7.4) ───────────────────────────────────────────────
+        sections["relationships"] = self._generate_section(
+            "7.4 Relationships, Marriage, and Partnership",
+            (
+                "Write a relationship section covering: romantic personality, dating patterns, "
+                "marriage potential (type and timing), spouse indications, and relationship "
+                "challenges. Use the 7th house, 5th house, Venus, Jupiter, and Moon. "
+                "Close with a 150–200 word final verdict on love and marriage. "
+                "Do not predict divorce or widowhood — phrase any difficulties as "
+                "'relationship stress requiring conscious work'."
+            ),
+            _domain_facts("relationships") + "\n\n" + "\n".join(
+                _brief_planet(p) for p in ["Venus", "Jupiter", "Moon", "Mars", "Rahu"]
+            ),
+            domain_rag.get("relationships", ""),
+        )
+        logger.info("  ✓ Relationships")
+
+        # ── Family + Health + Spirituality + Travel (7.5–7.8) ────────────────
+        sections["family_health_spirit"] = self._generate_section(
+            "7.5–7.8 Family, Health, Spirituality, Foreign Travel",
+            (
+                "Write four short sections (100–120 words each):\n"
+                "### 7.5 Family and Home\n"
+                "### 7.6 Health and Energy (no disease diagnosis — only vitality patterns)\n"
+                "### 7.7 Spirituality and Inner Development\n"
+                "### 7.8 Foreign Travel and Relocation\n"
+                "Each section must reference its specific house and planets from the facts."
+            ),
+            "\n\n".join([
+                "FAMILY:\n" + _domain_facts("family"),
+                "HEALTH:\n" + _domain_facts("health"),
+                "SPIRITUALITY:\n" + _domain_facts("spirituality"),
+                "TRAVEL:\n" + _domain_facts("travel"),
+            ]),
+            domain_rag.get("spirituality", ""),
+        )
+        logger.info("  ✓ Family/Health/Spirituality/Travel")
+
+        # ── Timing — Dasha Interpretation (8.2) ──────────────────────────────
+        ad_schedule_text = ""
+        for ad_entry in dt.get("antardashas", [])[:9]:
+            sub = ad_entry.get("sub_lord", "?")
+            s = ad_entry["start"].strftime("%Y-%m") if hasattr(ad_entry.get("start"), "strftime") else str(ad_entry.get("start", "?"))
+            e = ad_entry["end"].strftime("%Y-%m") if hasattr(ad_entry.get("end"), "strftime") else str(ad_entry.get("end", "?"))
+            ad_schedule_text += f"  {sub}: {s} → {e}\n"
+
+        md_placement = _brief_planet(md) if md and md in b["planet_strengths"] else f"{md} (unknown placement)"
+        facts_timing = (
+            f"Current Mahadasha: {md} (ends approx {current.get('end_date', '?')})\n"
+            f"Current Antardasha: {ad}\n"
+            f"MD nature: {lp['md_nature']}\n"
+            f"AD nature: {lp['ad_nature']}\n"
+            f"MD planet placement: {md_placement}\n"
+            f"Antardasha schedule:\n{ad_schedule_text}\n"
+            f"Activated life areas: {', '.join(lp['activated_areas'])}"
+        )
+        sections["dasha_interpretation"] = self._generate_section(
+            "8.2 Current Period Interpretation",
+            (
+                "Write a dasha interpretation covering:\n"
+                "- What this Mahadasha activates for this native\n"
+                "- Positive possibilities and challenges of this period\n"
+                "- How the Antardasha modifies the Mahadasha tone\n"
+                "- Practical advice for making the best use of this period\n"
+                "Aim for 150–200 words total."
+            ),
+            facts_timing,
+            domain_rag.get("dasha", ""),
+        )
+        logger.info("  ✓ Dasha interpretation")
+
+        # ── Final Verdict (13) ────────────────────────────────────────────────
+        theme_summary = "\n".join(
+            f"- {t['theme']} ({t['strength']})" for t in b["top_themes"]
+        )
+        facts_verdict = (
+            f"Lagna: {lagna} | Moon sign: {b['planet_strengths'].get('Moon', {}).get('sign', '?')}\n"
+            f"Current period: {md}/{ad}\n"
+            f"Top life themes:\n{theme_summary}\n"
+            f"Strong planets: {', '.join(strong_planets) or 'None'}\n"
+            f"Weak/challenged: {', '.join(weak_planets) or 'None'}"
+        )
+        sections["final_verdict"] = self._generate_section(
+            "13 Final Verdict",
+            (
+                "Write a direct, grounded final reading in 250–350 words covering: "
+                "the native's main life direction; what they should build; what they should "
+                "consciously avoid; what period they are entering; and the most important "
+                "practical advice. Do not be vague. Reference specific chart factors. "
+                "End with one empowering sentence."
+            ),
+            facts_verdict,
+            "",
+        )
+        logger.info("  ✓ Final verdict")
+
+        logger.info(f"All {len(sections)} sections generated")
+        return sections
+
     def analyze_chart(self, birth_data: BirthData) -> AstrologicalReading:
         """
         Perform complete astrological analysis using all layers.
@@ -611,48 +1054,53 @@ class AstrologicalOrchestrator:
             'structural': structural,
             'relationships': get_planet_relationships(planet_data)
         }
-        
-        # Generate Fact Sheet
+
+        # Generate Fact Sheet (used in Section 14 Appendix)
         fact_sheet = self._generate_fact_sheet(mathematical_data, logical_analysis)
-        
-        # STEP 3: Knowledge Layer (H-RAG)
-        logger.info("Step 3: Querying H-RAG knowledge base...")
+
+        # STEP 2b: Prediction Engine — pre-compute all Vedic reasoning
+        logger.info("Step 2b: Computing prediction brief (houses, lords, yogas, domains)...")
+        prediction_brief = self.prediction_engine.compute_brief(
+            mathematical_data, logical_analysis, birth_data.datetime
+        )
+        yogas_found = len(prediction_brief.get("yogas", []))
+        logger.info(f"✓ Prediction brief: {yogas_found} yogas, "
+                    f"{len(prediction_brief.get('domains', {}))} domains analysed")
+
+        # STEP 3: Knowledge Layer — domain-specific H-RAG queries
+        logger.info("Step 3: Querying H-RAG per domain...")
         rag_results = self._query_knowledge_base(mathematical_data, logical_analysis)
-        logger.info(f"✓ H-RAG: {len(rag_results)} parent context chunks retrieved")
-        
-        # Format RAG context for LLM — include child_hits score
-        rag_context = "\n\n".join([
-            f"[Source: {result['metadata'].get('source', 'Unknown')} | "
-            f"Relevance hits: {result.get('child_hits', '?')}]\n{result['content']}"
-            for result in rag_results
-        ]) if rag_results else "No relevant classical texts found in knowledge base."
-        
-        # STEP 4: Synthesis with LLM
+        domain_rag = self._query_knowledge_per_domain(
+            prediction_brief, mathematical_data, logical_analysis
+        )
+        logger.info(f"✓ H-RAG: {len(rag_results)} general + {len(domain_rag)} domain contexts")
+
+        # Format general RAG context for legacy fact sheet
+        rag_context_text = "\n\n".join([
+            f"[Source: {r['metadata'].get('source', 'Unknown')} | "
+            f"Hits: {r.get('child_hits', '?')}]\n{r['content']}"
+            for r in rag_results
+        ]) if rag_results else "No classical text context retrieved."
+
+        # STEP 4: Section-by-section LLM synthesis
+        report_sections: Dict[str, str] = {}
         synthesis = ""
-        
+
         if self.llm is not None:
-            logger.info("Step 4: Synthesizing with LLM...")
-            
-            try:
-                # Create synthesis chain
-                prompt = self._create_synthesis_prompt()
-                chain = prompt | self.llm | StrOutputParser()
-                
-                # Run synthesis
-                synthesis = chain.invoke({
-                    "fact_sheet": fact_sheet,
-                    "rag_context": rag_context
-                })
-                
-                logger.info("✓ Synthesis complete")
-                
-            except Exception as e:
-                logger.error(f"LLM synthesis failed: {e}")
-                synthesis = f"[LLM synthesis failed: {e}]\n\nFact Sheet:\n{fact_sheet}"
+            logger.info("Step 4: Generating 14-section report with LLM...")
+            report_sections = self._generate_sections(
+                prediction_brief, domain_rag, birth_data, mathematical_data
+            )
+            # Build legacy synthesis string for console output
+            synthesis = "\n\n---\n\n".join(
+                f"### {k.replace('_', ' ').title()}\n{v}"
+                for k, v in report_sections.items()
+                if v
+            )
         else:
-            logger.info("Step 4: No LLM provided, returning fact sheet")
-            synthesis = f"[No LLM configured - showing fact sheet only]\n\n{fact_sheet}"
-        
+            logger.info("Step 4: No LLM — returning structured data only")
+            synthesis = "[No LLM configured — structured data available in prediction_brief]"
+
         # Create final reading
         reading = AstrologicalReading(
             birth_data=birth_data,
@@ -660,9 +1108,11 @@ class AstrologicalOrchestrator:
             logical_analysis=logical_analysis,
             rag_context=rag_results,
             synthesis=synthesis,
-            fact_sheet=fact_sheet
+            fact_sheet=fact_sheet,
+            prediction_brief=prediction_brief,
+            report_sections=report_sections,
         )
-        
+
         logger.info("Chart analysis complete!")
         return reading
     

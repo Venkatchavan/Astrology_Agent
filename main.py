@@ -312,14 +312,13 @@ def _generate_south_indian_chart(mathematical_data, name=None):
 
 def _save_markdown(reading, dt, lat, lon, name, location_name, override_path=None):
     """
-    Always save a rich Markdown report to output/<slug>_<YYYYMMDD>_<HHMM>.md.
-    If override_path is given, save there instead (but still as .md).
+    Render and save the full 14-section Vedic Astrology Prediction Report.
+    If override_path is given, save there; otherwise output/<slug>_<YYYYMMDD>_<HHMM>.md
     """
     import re as _re
     from datetime import datetime as _dt
     from pathlib import Path as _Path
 
-    # Build filename slug
     name_slug = _re.sub(r'[^a-zA-Z0-9]+', '_', (name or "chart")).strip('_').lower()
     timestamp = dt.strftime("%Y%m%d_%H%M")
 
@@ -332,36 +331,525 @@ def _save_markdown(reading, dt, lat, lon, name, location_name, override_path=Non
         out_dir.mkdir(exist_ok=True)
         out_path = out_dir / f"{name_slug}_{timestamp}.md"
 
-    # ── Build Markdown ─────────────────────────────────────────────────────
     generated_at = _dt.now().strftime("%Y-%m-%d %H:%M")
     display_name = name or "—"
     display_place = location_name or "—"
 
-    # South Indian Rasi chart diagram
-    rasi_chart = _generate_south_indian_chart(reading.mathematical_data, name=display_name)
+    b = reading.prediction_brief or {}
+    sec = reading.report_sections or {}
+    md_data = reading.mathematical_data
+
+    # ── Helper: section text or placeholder ──────────────────────────────────
+    def S(key: str, fallback: str = "") -> str:
+        return sec.get(key, fallback).strip() if sec.get(key) else fallback
+
+    # ── Rasi chart ────────────────────────────────────────────────────────────
+    rasi_chart = _generate_south_indian_chart(md_data, name=display_name)
+
+    # ── Planetary position table ──────────────────────────────────────────────
+    PLANETS = ["Sun", "Moon", "Mars", "Mercury", "Jupiter", "Venus", "Saturn", "Rahu", "Ketu"]
+    navamsa = md_data.get("_navamsa", {})
+    asc = md_data.get("_ascendant", {})
+    ps = b.get("planet_strengths", {})
+    ph = b.get("planet_houses", {})
+    lordships = b.get("lordships", {})
+
+    def _planet_rows() -> str:
+        rows = []
+        for planet in PLANETS:
+            data = md_data.get(planet, {})
+            if not data:
+                continue
+            nak = data.get("nakshatra", {})
+            pstrength = ps.get(planet, {})
+            sign = pstrength.get("sign", "?")
+            deg = pstrength.get("degree", 0)
+            nname = nak.get("nakshatra_name", "?")
+            pada = nak.get("pada", "?")
+            retro = "Yes" if data.get("retrograde") else "No"
+            func_role = "/".join(f"H{h}" for h in lordships.get(planet, [])) or "—"
+            status = ", ".join(pstrength.get("status_list", [])) or "—"
+            d9_sign = navamsa.get(planet, {}).get("d9_sign", "?")
+            rows.append(
+                f"| {planet} | {sign} | {deg:.2f}° | {nname} | {pada} "
+                f"| {retro} | {func_role} | {status} | {d9_sign} |"
+            )
+        return "\n".join(rows)
+
+    # ── Core anchors table ────────────────────────────────────────────────────
+    def _anchor_rows() -> str:
+        rows = []
+        if asc:
+            nak = asc.get("nakshatra", {})
+            lagna_lord = b.get("lagna_lord", "?")
+            rows.append(
+                f"| Ascendant / Lagna | {asc.get('sign', '?')} {asc.get('degree', 0):.2f}° "
+                f"| {nak.get('nakshatra_name', '?')} / Pada {nak.get('pada', '?')} "
+                f"| {lagna_lord} | Very High |"
+            )
+        moon = md_data.get("Moon", {})
+        if moon:
+            moon_nak = moon.get("nakshatra", {})
+            moon_sign = ps.get("Moon", {}).get("sign", "?")
+            moon_deg = ps.get("Moon", {}).get("degree", 0)
+            rows.append(
+                f"| Moon | {moon_sign} {moon_deg:.2f}° "
+                f"| {moon_nak.get('nakshatra_name', '?')} / Pada {moon_nak.get('pada', '?')} "
+                f"| {moon_nak.get('ruler', '?')} | Very High |"
+            )
+        sun = md_data.get("Sun", {})
+        if sun:
+            sun_nak = sun.get("nakshatra", {})
+            sun_sign = ps.get("Sun", {}).get("sign", "?")
+            sun_deg = ps.get("Sun", {}).get("degree", 0)
+            rows.append(
+                f"| Sun | {sun_sign} {sun_deg:.2f}° "
+                f"| {sun_nak.get('nakshatra_name', '?')} / Pada {sun_nak.get('pada', '?')} "
+                f"| {sun_nak.get('ruler', '?')} | High |"
+            )
+        lp = b.get("life_phase", {})
+        md_lord = lp.get("mahadasha", "?")
+        if md_lord and md_lord in ps:
+            md_ps = ps[md_lord]
+            rows.append(
+                f"| Current Dasha Lord | {md_lord} in {md_ps.get('sign', '?')} (H{ph.get(md_lord, '?')}) "
+                f"| — | — | Very High |"
+            )
+        return "\n".join(rows)
+
+    # ── Dasha overview table ──────────────────────────────────────────────────
+    def _dasha_overview() -> str:
+        dt_data = b.get("dasha_timeline", {})
+        current = dt_data.get("current", {})
+        md_lord = current.get("mahadasha", "?")
+        ad_lord = current.get("antardasha", "?")
+        ad_end = current.get("end_date", "?")
+        schedule = dt_data.get("schedule", [])
+        md_entry = next((s for s in schedule if s.get("lord") == md_lord), {})
+        md_start = md_entry.get("start")
+        md_end = md_entry.get("end")
+        md_start_s = md_start.strftime("%Y-%m-%d") if hasattr(md_start, "strftime") else "?"
+        md_end_s = md_end.strftime("%Y-%m-%d") if hasattr(md_end, "strftime") else "?"
+        activated = ', '.join(b.get('life_phase', {}).get('activated_areas', [])[:3])
+        rows = [
+            f"| Mahadasha | {md_lord} | {md_start_s} | {md_end_s} | {activated} |",
+            f"| Antardasha | {ad_lord} | — | {ad_end} | Sub-period themes |",
+        ]
+        return "\n".join(rows)
+
+    # ── Antardasha schedule ───────────────────────────────────────────────────
+    def _antardasha_rows() -> str:
+        ads = b.get("dasha_timeline", {}).get("antardashas", [])
+        rows = []
+        for entry in ads:
+            sub = entry.get("sub_lord", "?")
+            s = entry["start"].strftime("%Y-%m-%d") if hasattr(entry.get("start"), "strftime") else "?"
+            e = entry["end"].strftime("%Y-%m-%d") if hasattr(entry.get("end"), "strftime") else "?"
+            rows.append(f"| {sub} | {s} | {e} |")
+        return "\n".join(rows)
+
+    # ── Upcoming mahadashas ───────────────────────────────────────────────────
+    def _upcoming_md_rows() -> str:
+        from engine.prediction_engine import PLANET_PHASE_TYPE
+        rows = []
+        for m in b.get("dasha_timeline", {}).get("upcoming_mds", []):
+            lord = m.get("lord", "?")
+            s = m["start"].strftime("%Y-%m-%d") if hasattr(m.get("start"), "strftime") else "?"
+            e = m["end"].strftime("%Y-%m-%d") if hasattr(m.get("end"), "strftime") else "?"
+            nature = PLANET_PHASE_TYPE.get(lord, "transition")
+            rows.append(f"| {lord} | {s} | {e} | {nature} |")
+        return "\n".join(rows)
+
+    # ── Top themes table ──────────────────────────────────────────────────────
+    def _top_themes_rows() -> str:
+        rows = []
+        for i, t in enumerate(b.get("top_themes", []), 1):
+            evidence = t.get("evidence", ["—"])
+            ev1 = (evidence[0][:80] if evidence else "—")
+            timing = t.get("timing", "—")[:60]
+            rows.append(f"| {i} | {t['theme']} | {t['strength']} | {ev1} | {timing} |")
+        return "\n".join(rows)
+
+    # ── Yoga table ────────────────────────────────────────────────────────────
+    def _yoga_rows() -> str:
+        rows = [
+            f"| {y['name']} | {y['type']} | {y['description'][:90]} "
+            f"| {', '.join(y['planets'])} | {y['confidence']} |"
+            for y in b.get("yogas", [])
+        ]
+        return "\n".join(rows) or "| — | — | No significant yogas detected | — | — |"
+
+    # ── Domain evidence list ──────────────────────────────────────────────────
+    def _domain_evidence(domain: str) -> str:
+        d = b.get("domains", {}).get(domain, {})
+        rows = [
+            f"- {'✓' if item.get('supports') else '✗'} {item['point']}"
+            for item in d.get("supporting", [])
+        ]
+        rows.append(f"- **Confidence:** {d.get('confidence', '?')} | {d.get('dasha_relevance', '?')}")
+        return "\n".join(rows)
+
+    # ── D9 Navamsa table ──────────────────────────────────────────────────────
+    def _d9_rows() -> str:
+        rows = []
+        for planet in PLANETS:
+            d9 = navamsa.get(planet, {})
+            d1_sign = ps.get(planet, {}).get("sign", "?")
+            d9_sign = d9.get("d9_sign", "?")
+            varg = "Yes ⭐" if d9.get("vargottama") else "No"
+            rows.append(f"| {planet} | {d1_sign} | {d9_sign} | {varg} |")
+        return "\n".join(rows)
+
+    # ── H-RAG evidence table ──────────────────────────────────────────────────
+    def _hrag_rows() -> str:
+        rows = [
+            f"| {r.get('metadata', {}).get('source', 'H-RAG context')} "
+            f"| {r.get('content', '')[:100].replace('|', '—').replace(chr(10), ' ')}… | — | Retrieved |"
+            for r in reading.rag_context[:8]
+        ]
+        return "\n".join(rows) or "| — | No H-RAG context retrieved | — | — |"
+
+    # ── High-confidence predictions ───────────────────────────────────────────
+    def _high_conf_rows() -> str:
+        rows = []
+        for domain, d in b.get("domains", {}).items():
+            if d.get("confidence") == "High":
+                sup = [e["point"] for e in d.get("supporting", []) if e.get("supports")]
+                ev = (sup + ["—", "—", "—"])[:3]
+                label = domain.replace("_", " ").title()
+                rows.append(
+                    f"| Strong {label} indication | {ev[0][:60]} | {ev[1][:60]} | {ev[2][:60]} | High |"
+                )
+        return "\n".join(rows) or "| — | — | — | — | High |"
+
+    # ── Low-confidence predictions ────────────────────────────────────────────
+    def _low_conf_rows() -> str:
+        rows = [
+            f"| {d.replace('_', ' ').title()} breakthrough | Insufficient dominant indicators "
+            f"| Stronger planetary support or dasha activation needed |"
+            for d, data in b.get("domains", {}).items()
+            if data.get("confidence") == "Low"
+        ]
+        return "\n".join(rows) or "| — | All domains have Medium or High indicators | — |"
+
+    # ── Nakshatra signature table ─────────────────────────────────────────────
+    def _nakshatra_rows() -> str:
+        rows = []
+        for anchor_name, planet_key in [
+            ("Moon Nakshatra", "Moon"),
+            ("Lagna Nakshatra", None),
+            ("Sun Nakshatra", "Sun"),
+        ]:
+            if planet_key:
+                nak = md_data.get(planet_key, {}).get("nakshatra", {})
+            else:
+                nak = asc.get("nakshatra", {}) if asc else {}
+            nname = nak.get("nakshatra_name", "?")
+            rows.append(f"| {anchor_name} | {nname} | — | — | — |")
+        return "\n".join(rows)
+
+    # ─── Assemble Markdown ────────────────────────────────────────────────────
+    lp = b.get("life_phase", {})
+    md_lord = lp.get("mahadasha", "?")
+    ad_lord = lp.get("antardasha", "?")
+    lagna = b.get("lagna", "?")
+    lagna_lord = b.get("lagna_lord", "?")
 
     lines = [
-        f"# Vedic Astrological Reading — {display_name}",
-        "",
-        "| Field | Value |",
-        "|-------|-------|",
-        f"| **Name** | {display_name} |",
-        f"| **Date & Time (IST)** | {dt.strftime('%Y-%m-%d %H:%M')} |",
-        f"| **Latitude / Longitude** | {lat}°N, {lon}°E |",
-        f"| **Birth Place** | {display_place} |",
-        f"| **Generated** | {generated_at} |",
+        f"# Vedic Astrology Prediction Report — {display_name}",
         "",
         "---",
         "",
-        "## Rasi Chart (South Indian Style)",
+        "## 0. Report Metadata",
+        "",
+        "| Field | Value |",
+        "|---|---|",
+        f"| Name | {display_name} |",
+        f"| Date of Birth | {dt.strftime('%Y-%m-%d')} |",
+        f"| Time of Birth | {dt.strftime('%H:%M')} IST |",
+        f"| Birth Place | {display_place} |",
+        f"| Latitude / Longitude | {lat}°N, {lon}°E |",
+        "| Ayanamsa | Lahiri |",
+        "| Chart System | Sidereal Vedic |",
+        f"| Generated At | {generated_at} |",
+        "| Engine | Astrology_Agent: Skyfield/JPL + Parashara + Vimshottari + H-RAG + Ollama |",
+        "",
+        "---",
+        "",
+        "## 1. Important Disclaimer",
+        "",
+        (
+            "This report is an interpretive Vedic astrology reading based on chart calculations, "
+            "classical rule-based reasoning, and retrieved knowledge from classical texts "
+            "(Brihat Parashara Hora Shastra and other Vedic references). It should not be treated "
+            "as medical, legal, financial, or life-critical advice. All predictions are expressed "
+            "as tendencies, timing windows, and symbolic indicators — not guaranteed outcomes. "
+            "Free will and conscious effort shape every result."
+        ),
+        "",
+        "---",
+        "",
+        "## 2. Executive Prediction Summary",
+        "",
+        "### 2.1 Top 7 Life Themes",
+        "",
+        "| Rank | Theme | Strength | Main Evidence | Dasha Relevance |",
+        "|---|---|---:|---|---|",
+        _top_themes_rows(),
+        "",
+        "### 2.2 One-Paragraph Summary & 2.3 Current Phase",
+        "",
+        S("executive_summary", "_No LLM summary available — see Section 3 for chart data._"),
+        "",
+        "---",
+        "",
+        "## 3. Calculation Audit",
+        "",
+        "### 3.1 Core Chart Anchors",
+        "",
+        "| Anchor | Placement | Nakshatra / Pada | Ruler | Interpretation Weight |",
+        "|---|---|---|---|---|",
+        _anchor_rows(),
+        "",
+        "### 3.2 Planetary Position Table",
+        "",
+        "| Planet | Sign | Degree | Nakshatra | Pada | Retro | Functional Role | Status | D9 Sign |",
+        "|---|---|---:|---|---:|---|---|---|---|",
+        _planet_rows(),
+        "",
+        "---",
+        "",
+        "## 4. Chart Foundation",
+        "",
+        "### 4.1 Lagna-Based Personality",
+        "",
+        S("lagna_personality", f"_Lagna: {lagna} | Lagna Lord: {lagna_lord} — LLM not available._"),
+        "",
+        f"**Evidence:** Lagna {lagna}, Lagna lord {lagna_lord} in "
+        f"House {ph.get(lagna_lord, '?')} "
+        f"({ps.get(lagna_lord, {}).get('sign', '?')}), "
+        f"{ps.get(lagna_lord, {}).get('overall', '?')}",
+        "",
+        "### 4.2 Moon-Based Mind and Emotional Pattern",
+        "",
+        S("moon_mind", "_Moon mind section — LLM not available._"),
+        "",
+        "### 4.3 Sun-Based Identity and Authority",
+        "",
+        S("sun_identity", "_Sun identity section — LLM not available._"),
+        "",
+        "### 4.4 Nakshatra Signature",
+        "",
+        "| Key Nakshatra | Point | Weight | Core Trait | Shadow Trait |",
+        "|---|---|---|---|---|",
+        _nakshatra_rows(),
+        "",
+        "---",
+        "",
+        "## 5. Strengths, Talents, and Natural Advantages",
+        "",
+        "### 5.1 Strongest Planets & Yogas",
+        "",
+        "| Yoga / Planet | Type | Description | Planets | Confidence |",
+        "|---|---|---|---|---|",
+        _yoga_rows(),
+        "",
+        "### 5.2 Natural Talents",
+        "",
+        S("strengths", "_Strengths section — LLM not available._"),
+        "",
+        "### 5.3 D9 / Navamsa Confirmation",
+        "",
+        "| Planet | D1 Sign | D9 Sign | Vargottama? |",
+        "|---|---|---|---|",
+        _d9_rows(),
+        "",
+        "---",
+        "",
+        "## 6. Challenges, Weaknesses, and Growth Areas",
+        "",
+        "### 6.1 Difficult Planetary Conditions",
+        "",
+        "| Issue | Planet/House | Status | Growth Advice |",
+        "|---|---|---|---|",
+    ]
+
+    # 6.1 weakness rows
+    from engine.prediction_engine import PLANET_NATURE as _PN
+    weak_rows = []
+    for planet, pdata in ps.items():
+        if pdata.get("overall") == "Weakened" or "Gandanta" in pdata.get("status_list", []):
+            issue = "Debilitated" if "Debilitated" in pdata.get("status_list", []) else "Gandanta"
+            weak_rows.append(
+                f"| {issue} | {planet} in H{ph.get(planet, '?')} ({pdata.get('sign', '?')}) "
+                f"| {pdata.get('overall', '?')} | Work consciously with {planet}'s themes |"
+            )
+    lines.extend(weak_rows or ["| — | No debilitated planets | — | — |"])
+
+    lines += [
+        "",
+        "### 6.2 Psychological Shadow Pattern",
+        "",
+        S("challenges", "_Challenges section — LLM not available._"),
+        "",
+        "---",
+        "",
+        "## 7. Domain-Wise Predictions",
+        "",
+        "---",
+        "",
+        "### 7.1 Career and Professional Growth",
+        "",
+        S("career", "_Career section — LLM not available._"),
+        "",
+        "**Evidence Chain:**",
+        "",
+        _domain_evidence("career"),
+        "",
+        "---",
+        "",
+        "### 7.2 Education, Intelligence, and Learning",
+        "",
+        "**Evidence Chain:**",
+        "",
+        _domain_evidence("education"),
+        "",
+        "---",
+        "",
+        "### 7.3 Wealth, Finance, and Assets",
+        "",
+        S("wealth", "_Wealth section — LLM not available._"),
+        "",
+        "**Evidence Chain:**",
+        "",
+        _domain_evidence("wealth"),
+        "",
+        "---",
+        "",
+        "### 7.4 Relationships, Marriage, and Partnership",
+        "",
+        S("relationships", "_Relationships section — LLM not available._"),
+        "",
+        "**Evidence Chain:**",
+        "",
+        _domain_evidence("relationships"),
+        "",
+        "---",
+        "",
+        "### 7.5 Family, Home, and Emotional Security",
+        "### 7.6 Health, Energy, and Lifestyle",
+        "### 7.7 Spirituality, Dharma, and Inner Development",
+        "### 7.8 Foreign Travel, Relocation, and Long-Distance Opportunities",
+        "",
+        S("family_health_spirit", "_Sections 7.5–7.8 — LLM not available._"),
+        "",
+        "---",
+        "",
+        "## 8. Timing Engine",
+        "",
+        "### 8.1 Vimshottari Dasha Overview",
+        "",
+        "| Level | Lord | Start | End | Activated Themes |",
+        "|---|---|---|---|---|",
+        _dasha_overview(),
+        "",
+        "**Full Antardasha Schedule (Current Mahadasha):**",
+        "",
+        "| Antardasha Lord | Start | End |",
+        "|---|---|---|",
+        _antardasha_rows(),
+        "",
+        "### 8.2 Current Period Interpretation",
+        "",
+        S("dasha_interpretation", "_Dasha interpretation — LLM not available._"),
+        "",
+        "### 8.3 Upcoming Mahadashas",
+        "",
+        "| Lord | Start | End | Phase Nature |",
+        "|---|---|---|---|",
+        _upcoming_md_rows(),
+        "",
+        "---",
+        "",
+        "## 9. High-Confidence Predictions",
+        "",
+        "| Prediction | Evidence 1 | Evidence 2 | Evidence 3 | Confidence |",
+        "|---|---|---|---|---|",
+        _high_conf_rows(),
+        "",
+        "---",
+        "",
+        "## 10. Low-Confidence or Conditional Predictions",
+        "",
+        "| Possible Outcome | Why Uncertain | What Would Strengthen It |",
+        "|---|---|---|",
+        _low_conf_rows(),
+        "",
+        "---",
+        "",
+        "## 11. Classical Text / H-RAG Evidence",
+        "",
+        "| Source | Retrieved Principle | Applied To | Interpretation |",
+        "|---|---|---|---|",
+        _hrag_rows(),
+        "",
+        "---",
+        "",
+        "## 12. Remedies and Practical Guidance",
+        "",
+        "### 12.1 Behavioural Remedies",
+        "",
+        "| Issue | Behavioural Remedy | Reason |",
+        "|---|---|---|",
+    ]
+
+    remedy_rows = []
+    for planet, pdata in ps.items():
+        if pdata.get("overall") == "Weakened":
+            remedy_rows.append(
+                f"| {planet} weakness | Honour {planet}'s significations: "
+                f"{_PN.get(planet, 'its domain')} | Counteracts debilitation |"
+            )
+        if pdata.get("retrograde"):
+            remedy_rows.append(
+                f"| {planet} retrograde | Reflect before acting in {planet}'s domain; "
+                f"avoid impulsiveness | Retrograde energy rewards patience |"
+            )
+    lines.extend(remedy_rows or ["| — | No specific remedies identified | — |"])
+
+    lines += [
+        "",
+        "### 12.2 Practical Action Plan",
+        "",
+        "**Next 30 Days:**",
+        f"- Focus on areas activated by current {ad_lord} Antardasha",
+        f"- Strengthen {lagna_lord} (Lagna lord) through consistent daily practice",
+        "",
+        "**Next 90 Days:**",
+        f"- Build momentum in domains where {md_lord} Mahadasha is supportive",
+        "- Address any Weakened planet's domain through disciplined effort",
+        "",
+        "**Next 1 Year:**",
+        "- Review career and relationship timing windows from Section 8",
+        "- Re-evaluate at the next Antardasha transition",
+        "",
+        "---",
+        "",
+        "## 13. Final Verdict",
+        "",
+        S("final_verdict", "_Final verdict — LLM not available. See Section 2 for top themes._"),
+        "",
+        "---",
+        "",
+        "## 14. Appendix",
+        "",
+        "### 14.1 Rasi Chart (South Indian Style)",
         "",
         "```",
         rasi_chart,
         "```",
         "",
-        "---",
-        "",
-        "## Chart Data",
+        "### 14.2 Raw Fact Sheet",
         "",
         "```",
         reading.fact_sheet.strip(),
@@ -369,17 +857,11 @@ def _save_markdown(reading, dt, lat, lon, name, location_name, override_path=Non
         "",
         "---",
         "",
-        "## Interpretation",
-        "",
-        reading.synthesis.strip(),
-        "",
-        "---",
-        "",
-        "*Generated by Astrology Agent — H-RAG + Ollama (llama3.2) — Fully Local, No API Key*",
+        "*Generated by Astrology Agent — Skyfield/JPL + H-RAG + Ollama — Fully Local*",
     ]
 
     out_path.write_text("\n".join(lines), encoding="utf-8")
-    logger.info(f"✓ Markdown saved → {out_path}")
+    logger.info(f"✓ Report saved → {out_path}")
     return out_path
 
 
